@@ -28,10 +28,12 @@ from .pack import (GhostPacksError, default_library_dirs, find_packs,
 
 
 def _is_pack_dir(path) -> bool:
+    """True when *path* is a folder containing a ``pack.json`` manifest."""
     return (Path(path) / "pack.json").is_file()
 
 
 def cmd_lint(args) -> int:
+    """`lint`: print warnings, then errors; 0 only when the pack is valid."""
     errors, warnings = lint_pack(args.pack)
     for w in warnings:
         print(f"warning: {w}")
@@ -46,6 +48,7 @@ def cmd_lint(args) -> int:
 
 
 def cmd_list(args) -> int:
+    """`list`: print the library search path, then one line (or JSON row) per pack."""
     dirs = default_library_dirs(args.library)
     print("library: " + ", ".join(str(d) for d in dirs))
     folders = find_packs(dirs)
@@ -75,6 +78,7 @@ def cmd_list(args) -> int:
 
 
 def cmd_show(args) -> int:
+    """`show`: print one pack's summary, score status, and profile fragment."""
     pack_dir = resolve_pack(args.pack, default_library_dirs(args.library))
     pack = load_pack(pack_dir)
     if args.json:
@@ -104,6 +108,7 @@ def cmd_show(args) -> int:
 
 
 def cmd_merge(args) -> int:
+    """`merge`: preview and (on a yes) apply a pack merge; see manager.merge_pack."""
     dirs = default_library_dirs(args.library)
     if args.pack and args.project:
         first, second = args.pack, args.project
@@ -125,6 +130,7 @@ def cmd_merge(args) -> int:
 
 
 def cmd_remove(args) -> int:
+    """`remove`: reverse one recorded merge; see manager.remove_pack."""
     project, pack_id = args.project, args.pack
     # Tolerate swapped order when the first arg is a bare pack id that
     # does not exist as a folder while the second does.
@@ -136,6 +142,7 @@ def cmd_remove(args) -> int:
 
 
 def cmd_doctor(args) -> int:
+    """`doctor`: a pack folder target gets pack checks, anything else project checks."""
     target = Path(args.target) if args.target else Path.cwd()
     if _is_pack_dir(target):
         report = doctor_pack(target)
@@ -151,6 +158,7 @@ def cmd_doctor(args) -> int:
 
 
 def cmd_init_pack(args) -> int:
+    """`init-pack`: draft a pack from a project and print the next steps."""
     stack = [s.strip() for s in args.stack.split(",")] if args.stack else []
     result = create_pack_from_project(
         args.project, args.out, pack_id=args.id, name=args.name,
@@ -166,35 +174,56 @@ def cmd_init_pack(args) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Build the argument parser (one subcommand per manager operation)."""
     p = argparse.ArgumentParser(
         prog="ghostpacks",
         description="Shareable, data-only GhostSlice context packs: "
                     "lint, list, show, merge, remove, doctor, init-pack. "
-                    "Local folders only; no network, no code installation.")
+                    "Local folders only; no network, no code installation.",
+        epilog="Examples:\n"
+               "  ghostpacks lint packs/python-library\n"
+               "  ghostpacks show python-library\n"
+               "  ghostpacks merge packs/python-library ~/my-project\n"
+               "  ghostpacks remove ~/my-project python-library\n"
+               "  ghostpacks doctor ~/my-project\n"
+               "  ghostpacks init-pack ~/my-project -o my-new-pack\n"
+               "\n"
+               "Exit codes: 0 = ok, 1 = lint failure, merge conflict, or a\n"
+               "declined / not-done operation, 2 = usage or pack error.\n"
+               "Run 'ghostpacks <command> --help' for one command's options.",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--version", action="version",
                    version=f"ghostpacks {__version__}")
     sub = p.add_subparsers(dest="command", required=True)
 
-    sp = sub.add_parser("lint", help="validate a pack folder")
-    sp.add_argument("pack")
+    sp = sub.add_parser("lint", help="validate a pack folder (data only, "
+                                     "manifest, profile fragment, Bench claim)")
+    sp.add_argument("pack", help="path to the pack folder to validate")
     sp.set_defaults(fn=cmd_lint)
 
     sp = sub.add_parser("list", help="list packs in the local library")
-    sp.add_argument("--library")
-    sp.add_argument("--json", action="store_true")
+    sp.add_argument("--library", metavar="DIR",
+                    help="library folder to search instead of the defaults "
+                         "($GHOSTPACKS_LIBRARY, ~/.ghostpacks, bundled packs/)")
+    sp.add_argument("--json", action="store_true",
+                    help="print machine-readable JSON instead of summary lines")
     sp.set_defaults(fn=cmd_list)
 
-    sp = sub.add_parser("show", help="show one pack (id or folder)")
-    sp.add_argument("pack")
-    sp.add_argument("--library")
-    sp.add_argument("--json", action="store_true")
+    sp = sub.add_parser("show", help="show one pack (id or folder), "
+                                     "including its score status")
+    sp.add_argument("pack", help="pack folder path, or a pack id from the library")
+    sp.add_argument("--library", metavar="DIR",
+                    help="library folder to search for a pack id")
+    sp.add_argument("--json", action="store_true",
+                    help="print the manifest and profile fragment as JSON")
     sp.set_defaults(fn=cmd_show)
 
     sp = sub.add_parser("merge", help="merge a pack into a project profile "
                                       "(preview + explicit yes; either arg order)")
-    sp.add_argument("pack")
-    sp.add_argument("project")
-    sp.add_argument("--library")
+    sp.add_argument("pack", help="pack folder path, or a pack id from the library")
+    sp.add_argument("project", help="project folder whose .ghostslice.json is updated")
+    sp.add_argument("--library", metavar="DIR",
+                    help="library folder to search for a pack id")
     sp.add_argument("--yes", action="store_true",
                     help="skip the confirmation prompt (diff still printed)")
     sp.add_argument("--force", action="store_true",
@@ -202,33 +231,43 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(fn=cmd_merge)
 
     sp = sub.add_parser("remove", help="reverse a recorded pack merge in a project")
-    sp.add_argument("project")
+    sp.add_argument("project", help="project folder the pack was merged into")
     sp.add_argument("pack", help="pack id as recorded in the lockfile")
-    sp.add_argument("--yes", action="store_true")
+    sp.add_argument("--yes", action="store_true",
+                    help="skip the confirmation prompt")
     sp.add_argument("--force", action="store_true",
                     help="restore the backup even if the profile was edited "
                          "or later packs were merged")
     sp.set_defaults(fn=cmd_remove)
 
-    sp = sub.add_parser("doctor", help="check a pack folder or a project")
-    sp.add_argument("target", nargs="?", default=None)
-    sp.add_argument("--library")
-    sp.add_argument("--json", action="store_true")
+    sp = sub.add_parser("doctor", help="check a pack folder or a project "
+                                       "(validity, compatibility, staleness)")
+    sp.add_argument("target", nargs="?", default=None,
+                    help="pack folder or project folder "
+                         "(default: the current folder)")
+    sp.add_argument("--library", metavar="DIR",
+                    help="library folder to search when checking a project")
+    sp.add_argument("--json", action="store_true",
+                    help="print the report as JSON")
     sp.set_defaults(fn=cmd_doctor)
 
     sp = sub.add_parser("init-pack", help="draft a pack from a project's tuned profile")
-    sp.add_argument("project")
-    sp.add_argument("-o", "--out", required=True)
-    sp.add_argument("--id", dest="id")
-    sp.add_argument("--name")
-    sp.add_argument("--author")
-    sp.add_argument("--stack", help="comma-separated stack tags")
-    sp.add_argument("--force", action="store_true")
+    sp.add_argument("project", help="project folder with a tuned .ghostslice.json")
+    sp.add_argument("-o", "--out", required=True, metavar="DIR",
+                    help="folder to write the draft pack into (required)")
+    sp.add_argument("--id", dest="id", metavar="ID",
+                    help="pack id for the draft (default: slug of the project name)")
+    sp.add_argument("--name", help="human-readable pack name")
+    sp.add_argument("--author", help="author name recorded in the draft manifest")
+    sp.add_argument("--stack", help="comma-separated stack tags, e.g. 'python,django'")
+    sp.add_argument("--force", action="store_true",
+                    help="overwrite draft files in a non-empty output folder")
     sp.set_defaults(fn=cmd_init_pack)
     return p
 
 
 def main(argv=None) -> int:
+    """Parse *argv* (default: sys.argv) and dispatch; GhostPacksError -> exit 2."""
     args = build_parser().parse_args(argv)
     try:
         return args.fn(args)

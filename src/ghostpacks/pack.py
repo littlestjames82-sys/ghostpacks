@@ -15,8 +15,13 @@ Hard rules enforced here (PLAN.md, GhostPacks v0.1):
   no file with an executable permission bit anywhere in the folder.
 - No absolute paths anywhere in the manifest or the profile fragment.
 - A pack that claims a Bench score must reference a Bench report file
-  that exists inside the pack. A pack with no score is *unscored* and
-  is labelled that way everywhere, never silently presented as scored.
+  that exists inside the pack, and lint opens that report and checks
+  it: the report must be a JSON object, its ``score`` field must equal
+  the claimed score, and it must name the reference project the score
+  was measured on. A report outside the pack folder (via ``..`` or a
+  symlink), a non-numeric claim, or a mismatched report backs nothing.
+  A pack with no score is *unscored* and is labelled that way
+  everywhere, never silently presented as scored.
 - The profile fragment is validated against the live GhostSlice
   profile schema (top-level keys, mode names, presets, lint rules and
   options, floor sections): an unknown key fails loudly, by name.
@@ -24,9 +29,11 @@ Hard rules enforced here (PLAN.md, GhostPacks v0.1):
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from dataclasses import dataclass, field
+from datetime import date as _date
 from pathlib import Path
 
 KIND = "context"
@@ -189,6 +196,135 @@ def validate_profile_fragment(data, where="profile fragment",
     return data
 
 
+def _is_real_date(value) -> bool:
+    """True only for a real calendar date in YYYY-MM-DD form (the
+    regex alone happily accepts 2026-02-30)."""
+    if not isinstance(value, str) or not _DATE_RE.match(value):
+        return False
+    try:
+        _date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _valid_score(score) -> bool:
+    return (not isinstance(score, bool)
+            and isinstance(score, (int, float))
+            and math.isfinite(score) and score >= 0)
+
+
+def _is_finite_number(value) -> bool:
+    return (isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value))
+
+
+def _bench_report_errors(manifest: dict, root: Path) -> list:
+    """Cross-check a claimed Bench score against its report file.
+
+    Merged harden + deepen verification: a claim is backed only when
+    every check holds.
+
+    - The claimed score is a finite, non-negative number (a string,
+      bool, dict, or negative value backs nothing).
+    - The report path is relative and resolves to a file *inside*
+      the pack folder, so a ``..`` segment or a symlink cannot
+      borrow a report from elsewhere.
+    - The report parses as a JSON object.
+    - Its ``score`` field is present, is itself a valid score, and
+      equals the claimed score (the harden lane alone accepted a
+      report carrying no score of its own; the deepen lane requires
+      the field, and the stricter rule wins).
+    - It names the reference project the run measured
+      (``reference_project``, or a non-empty ``reference_projects``
+      list).
+    - A ``savings_percent`` field, when present, is a number
+      between 0 and 100.
+
+    Returns a list of error strings; empty means the claim is backed
+    (or that no report is named and no score is claimed)."""
+    errs = []
+    score, report = _score_claim(manifest)
+    if score is not None and not _valid_score(score):
+        errs.append(
+            f"pack.json: claimed Bench score must be a finite number "
+            f"and non-negative, got {score!r}")
+    if report is None:
+        if score is not None:
+            errs.append("pack.json: pack claims a Bench score but names "
+                        "no bench_report file")
+        return errs
+    if not isinstance(report, str) or not report:
+        errs.append(f"pack.json: bench_report must be a relative path "
+                    f"inside the pack, got {report!r}")
+        return errs
+    if _is_absolute(report):
+        errs.append(f"pack.json: bench_report {report!r} must be a "
+                    "relative path inside the pack")
+        return errs
+    root_resolved = Path(root).resolve()
+    candidate = (root_resolved / report).resolve()
+    if not candidate.is_relative_to(root_resolved):
+        errs.append(
+            f"pack.json: bench_report {report!r} points outside the "
+            "pack folder; the report backing a score must live in the pack")
+        return errs
+    if not candidate.is_file():
+        if score is not None:
+            errs.append(
+                f"pack.json: pack claims score {score!r} but its Bench "
+                f"report {report!r} is not in the pack folder")
+        else:
+            errs.append(
+                f"pack.json: bench_report {report!r} is named but not "
+                "in the pack folder")
+        return errs
+    try:
+        data = json.loads(candidate.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        errs.append(
+            f"pack.json: Bench report {report!r} is not readable JSON: "
+            f"{exc}")
+        return errs
+    if not isinstance(data, dict):
+        errs.append(
+            f"pack.json: Bench report {report!r} must be a JSON object")
+        return errs
+    if score is not None:
+        ref = data.get("reference_project")
+        refs = data.get("reference_projects")
+        has_ref = (isinstance(ref, str) and bool(ref.strip())) or (
+            isinstance(refs, list)
+            and any(isinstance(v, str) and v.strip() for v in refs))
+        if not has_ref:
+            errs.append(
+                f"pack.json: Bench report {report!r} names no "
+                "reference_project; a score must state what project "
+                "it was measured on")
+        if "score" not in data:
+            errs.append(
+                f"pack.json: Bench report {report!r} contains no "
+                "'score' field to back the claimed score")
+        elif not _valid_score(data["score"]):
+            errs.append(
+                f"pack.json: Bench report {report!r} carries an "
+                f"invalid score {data['score']!r}; a report score "
+                "must be a finite number and non-negative")
+        elif _valid_score(score) and float(data["score"]) != float(score):
+            errs.append(
+                f"pack.json: claimed Bench score {score!r} does not "
+                f"match the score {data['score']!r} in Bench report "
+                f"{report!r}")
+    savings = data.get("savings_percent")
+    if savings is not None and (
+            not _is_finite_number(savings) or not 0 <= savings <= 100):
+        errs.append(
+            f"pack.json: Bench report {report!r} 'savings_percent' "
+            f"must be a number between 0 and 100, got {savings!r}")
+    return errs
+
+
 def _score_claim(manifest: dict):
     """Return (claimed_score_or_None, bench_report_name_or_None)."""
     score = None
@@ -206,20 +342,28 @@ def _score_claim(manifest: dict):
 
 @dataclass
 class Pack:
+    """A loaded pack: its folder, parsed manifest, and profile fragment.
+
+    Use :func:`load_pack` to build one; direct construction skips the
+    manifest and fragment validation that loader performs.
+    """
     path: Path
     manifest: dict
     profile: dict
 
     @property
     def id(self) -> str:
+        """Pack id from the manifest (folder name when absent)."""
         return self.manifest.get("id", self.path.name)
 
     @property
     def version(self) -> str:
+        """Manifest version string ("?" when absent)."""
         return self.manifest.get("version", "?")
 
     @property
     def stack_tags(self) -> list:
+        """Stack tags, from the first of stack_tags / stack / tags that is set."""
         for key in ("stack_tags", "stack", "tags"):
             val = self.manifest.get(key)
             if isinstance(val, list):
@@ -230,6 +374,7 @@ class Pack:
 
     @property
     def slice_range(self) -> str | None:
+        """Declared GhostSlice version range, or None when the pack states none."""
         for key in ("ghostslice", "ghostslice_range", "compatible_ghostslice"):
             if isinstance(self.manifest.get(key), str):
                 return self.manifest[key]
@@ -240,27 +385,34 @@ class Pack:
 
     @property
     def claimed_score(self):
+        """Bench score the manifest claims, or None when it claims none."""
         return _score_claim(self.manifest)[0]
 
     @property
     def bench_report(self) -> str | None:
+        """Name of the Bench report file the manifest references, or None."""
         return _score_claim(self.manifest)[1]
 
     @property
     def score_status(self) -> str:
-        """"scored" only with a claimed score AND a report on disk."""
+        """"scored" only with a valid claimed score AND a Bench report
+        inside the pack that actually backs it (see
+        _bench_report_errors)."""
         score, report = _score_claim(self.manifest)
-        if score is not None and report and (self.path / report).is_file():
+        if (_valid_score(score) and report
+                and not _bench_report_errors(self.manifest, self.path)):
             return "scored"
         return "unscored"
 
     def summary_line(self) -> str:
+        """One-line label: id, version, kind, score status, and stack tags."""
         tags = ", ".join(self.stack_tags) or "no stack tags"
         return (f"{self.id} {self.version} (kind: {KIND}, {self.score_status}) "
                 f"[{tags}]")
 
 
 def _read_json(path: Path, what: str) -> dict:
+    """Read *path* as a JSON object, raising GhostPacksError on any failure."""
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except OSError as exc:
@@ -293,6 +445,11 @@ def load_pack(pack_dir) -> Pack:
 
 
 def _manifest_errors(manifest: dict, root: Path) -> list:
+    """All manifest problems as strings (empty list = the manifest is valid).
+
+    Shared by load_pack (which raises on the first joined list) and
+    lint_pack (which reports every problem at once).
+    """
     errs = []
     pid = manifest.get("id")
     if not isinstance(pid, str) or not _ID_RE.match(pid):
@@ -305,28 +462,19 @@ def _manifest_errors(manifest: dict, root: Path) -> list:
             f"pack.json: 'kind' must be {KIND!r} (context pack), "
             f"got {manifest.get('kind')!r}; policy/permission packs are not context packs")
     date = manifest.get("date")
-    if date is not None and (not isinstance(date, str) or not _DATE_RE.match(date)):
-        errs.append(f"pack.json: 'date' must be YYYY-MM-DD, got {date!r}")
+    if date is not None and not _is_real_date(date):
+        errs.append(f"pack.json: 'date' must be a real date as YYYY-MM-DD, got {date!r}")
+    if manifest.get("bench") is not None and not isinstance(manifest.get("bench"), dict):
+        errs.append("pack.json: 'bench' must be an object with 'score' and 'report'")
     bench_date = None
     if isinstance(manifest.get("bench"), dict):
         bench_date = manifest["bench"].get("date")
-        if bench_date is not None and not _DATE_RE.match(str(bench_date)):
-            errs.append(f"pack.json: bench date must be YYYY-MM-DD, got {bench_date!r}")
+        if bench_date is not None and not _is_real_date(bench_date):
+            errs.append(f"pack.json: bench date must be a real date as YYYY-MM-DD, got {bench_date!r}")
     for trail, value in _walk_strings(manifest):
         if value and _is_absolute(value):
             errs.append(f"pack.json: {trail} is an absolute path ({value!r}); pack paths must be relative")
-    score, report = _score_claim(manifest)
-    if score is not None:
-        if not report:
-            errs.append("pack.json: pack claims a Bench score but names no bench_report file")
-        elif not (root / report).is_file():
-            errs.append(
-                f"pack.json: pack claims score {score!r} but its Bench report "
-                f"{report!r} is not in the pack folder")
-        elif _is_absolute(str(report)):
-            errs.append(f"pack.json: bench_report {report!r} must be a relative path inside the pack")
-    elif report and not (root / report).is_file():
-        errs.append(f"pack.json: bench_report {report!r} is named but not in the pack folder")
+    errs.extend(_bench_report_errors(manifest, root))
     for key in ("stack_tags", "stack", "tags", "reference_projects"):
         val = manifest.get(key)
         if val is not None and not isinstance(val, (str, list)):
@@ -345,11 +493,23 @@ def lint_pack(pack_dir) -> tuple:
     warnings: list = []
     if not root.is_dir():
         return [f"{root}: not a pack folder"], warnings
-    # Data-only sweep over every file in the folder.
+    # Data-only sweep over every file in the folder. Hidden files are
+    # NOT exempt: a dot-prefixed script (.evil.py, an executable
+    # .hidden.txt) is exactly the kind of file this sweep exists to
+    # catch. Symlinks are rejected outright (a pack is self-contained
+    # data; a link can point at anything on the reader's machine),
+    # and non-regular files (fifos, sockets, devices) are rejected
+    # without being read, since reading one could block forever.
     for item in sorted(root.rglob("*")):
-        if item.is_dir() or item.name.startswith("."):
-            continue
         rel = item.relative_to(root).as_posix()
+        if item.is_symlink():
+            errors.append(f"{rel}: symlink in a pack; packs are self-contained data only and a symlink can point outside the pack")
+            continue
+        if item.is_dir():
+            continue
+        if not item.is_file():
+            errors.append(f"{rel}: not a regular file; packs are data only")
+            continue
         suffix = item.suffix.lower()
         if suffix in EXECUTABLE_SUFFIXES:
             errors.append(f"{rel}: executable/script file in a pack; packs are data only")

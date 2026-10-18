@@ -22,12 +22,20 @@ LIST_KEYS = ("ignore", "entry_points", "plugins")
 
 
 def _slug(text: str) -> str:
+    """Lowercase *text* into a pack-id slug ("my-pack" when nothing survives)."""
     slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
     return slug or "my-pack"
 
 
 def create_pack_from_project(project, out_dir, pack_id=None, name=None,
                              author=None, stack_tags=None, force=False) -> dict:
+    """Draft a pack from a project's tuned profile and write it to *out_dir*.
+
+    Returns {pack_id, out_dir, stripped, files, score_status}; `stripped`
+    lists every absolute path dropped from the fragment. The draft is
+    always unscored. Raises GhostPacksError when the project has no
+    profile or the output folder is non-empty without *force*.
+    """
     project = Path(project)
     out_dir = Path(out_dir)
     profile, raw = load_project_profile(project)
@@ -35,7 +43,11 @@ def create_pack_from_project(project, out_dir, pack_id=None, name=None,
         raise GhostPacksError(
             f"{project}: no .ghostslice.json to turn into a pack; tune a "
             "profile with GhostSlice first")
-    if out_dir.exists() and any(out_dir.iterdir()) and not force:
+    if out_dir.exists() and not out_dir.is_dir():
+        raise GhostPacksError(
+            f"{out_dir}: already exists and is not a folder; cannot write "
+            "a draft pack there")
+    if out_dir.is_dir() and any(out_dir.iterdir()) and not force:
         raise GhostPacksError(
             f"{out_dir}: already exists and is not empty; pass --force to "
             "overwrite the draft files")

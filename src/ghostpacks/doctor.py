@@ -60,6 +60,10 @@ def version_in_range(version: str, range_spec: str | None) -> bool | None:
 
 def doctor_pack(pack_dir, slice_version=DEFAULT_SLICE_VERSION,
                 today=None) -> dict:
+    """Check one pack folder; returns {target, kind, checks, ok}.
+
+    Each check is {name, status, detail} with status ok / warn / error.
+    """
     today = today or date.today()
     errors, warnings = lint_pack(pack_dir)
     checks = [{"name": "lint", "status": "ok" if not errors else "error",
@@ -131,6 +135,12 @@ def doctor_pack(pack_dir, slice_version=DEFAULT_SLICE_VERSION,
 
 def doctor_project(project, library_dirs=(), slice_version=DEFAULT_SLICE_VERSION,
                    today=None) -> dict:
+    """Check one project folder; same report shape as doctor_pack.
+
+    Also lists the packs available in *library_dirs* as informational
+    checks. Doctor never raises on a broken profile or lockfile: the
+    failure becomes an error check instead.
+    """
     project = Path(project)
     checks = []
     if not project.is_dir():
@@ -191,6 +201,7 @@ def doctor_project(project, library_dirs=(), slice_version=DEFAULT_SLICE_VERSION
 
 
 def format_report(report: dict) -> str:
+    """Render a doctor report dict as the plain-text block the CLI prints."""
     lines = [f"ghostpacks doctor: {report['target']} ({report['kind']})"]
     for check in report["checks"]:
         lines.append(f"  [{check['status'].upper():5}] {check['name']}: {check['detail']}")

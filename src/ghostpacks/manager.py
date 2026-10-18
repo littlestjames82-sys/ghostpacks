@@ -69,7 +69,9 @@ def _load_json_file(path: Path, what: str) -> dict:
 
 
 def load_project_profile(project: Path) -> tuple:
-    """(profile dict, raw bytes or None) for a project's profile."""
+    """(profile dict, raw bytes or None) for a project's profile.
+
+    A project with no .ghostslice.json yet yields ({}, None)."""
     profile_path = Path(project) / PROFILE_NAME
     if not profile_path.is_file():
         return {}, None
@@ -83,6 +85,7 @@ def load_project_profile(project: Path) -> tuple:
 
 
 def load_lockfile(project: Path) -> dict:
+    """The project's packs lockfile dict ({"packs": []} when none exists)."""
     path = Path(project) / LOCKFILE_NAME
     if not path.is_file():
         return {"packs": []}
@@ -90,7 +93,52 @@ def load_lockfile(project: Path) -> dict:
     if not isinstance(data.get("packs", []), list):
         raise GhostPacksError(f"{path}: lockfile 'packs' must be a list")
     data.setdefault("packs", [])
+    if any(not isinstance(e, dict) for e in data["packs"]):
+        raise GhostPacksError(
+            f"{path}: every lockfile 'packs' entry must be an object")
     return data
+
+
+def _ask(input_fn, prompt: str) -> str:
+    """One confirmation prompt. A closed stdin (EOF) or Ctrl-C counts
+    as a no, never as a traceback: a non-interactive caller that did
+    not pass --yes has not consented to anything."""
+    try:
+        return input_fn(prompt)
+    except (EOFError, KeyboardInterrupt):
+        return ""
+
+
+def _validated_backup_path(project: Path, entry: dict) -> Path | None:
+    """The entry's backup as a Path, guaranteed inside the project's
+    backup folder, or None when the entry records no backup.
+
+    The lockfile is data on disk and can be edited or corrupted, so a
+    recorded backup path is never trusted blindly: an absolute or
+    ``..`` path (or a symlink) pointing outside ``BACKUP_DIR_NAME``
+    would otherwise let `remove` copy an arbitrary file over the
+    project profile and then delete that file. Refuse loudly."""
+    rel = entry.get("backup")
+    if rel is None:
+        return None
+    if not isinstance(rel, str) or not rel:
+        raise GhostPacksError(
+            f"lockfile entry for pack {entry.get('pack_id')!r} has an "
+            f"invalid backup path {rel!r}; refusing to remove")
+    candidate = Path(project) / rel
+    backup_root = (Path(project) / BACKUP_DIR_NAME).resolve()
+    try:
+        resolved = candidate.resolve()
+    except OSError as exc:
+        raise GhostPacksError(
+            f"recorded backup {rel!r} cannot be resolved: {exc}") from exc
+    if backup_root not in resolved.parents:
+        raise GhostPacksError(
+            f"recorded backup {rel!r} for pack "
+            f"{entry.get('pack_id')!r} is not inside "
+            f"{BACKUP_DIR_NAME}/; refusing to restore or delete a path "
+            "outside the project's backup folder")
+    return candidate
 
 
 def _write_json(path: Path, data: dict) -> None:
@@ -101,7 +149,12 @@ def _write_json(path: Path, data: dict) -> None:
 
 
 def plan_merge(existing: dict, fragment: dict) -> tuple:
-    """Compute (merged, conflicts) without touching disk."""
+    """Compute (merged, conflicts) without touching disk.
+
+    Merge rules are the ones in this module's docstring: lists union,
+    modes union per glob, and any key both sides set differently is a
+    conflict (the existing value is kept in `merged` until --force).
+    """
     merged: dict = {}
     conflicts: list = []
     for key in LIST_KEYS:
@@ -171,6 +224,7 @@ def apply_force(merged: dict, existing: dict, fragment: dict, conflicts: list) -
 
 
 def profile_diff(before: dict, after: dict, existed: bool) -> str:
+    """Unified diff of the profile JSON, as shown in the merge preview."""
     before_lines = _dump_profile(before).splitlines(keepends=True) if existed else []
     after_lines = _dump_profile(after).splitlines(keepends=True)
     return "".join(difflib.unified_diff(
@@ -226,8 +280,8 @@ def merge_pack(project, pack_dir, assume_yes=False, force=False,
         return {"status": "unchanged", "pack": pack.id,
                 "version": pack.version, "diff": "", "conflicts": conflicts}
     if not assume_yes:
-        answer = input_fn(f"Merge pack {pack.id} {pack.version} into "
-                          f"{project}/{PROFILE_NAME}? [y/N] ")
+        answer = _ask(input_fn, f"Merge pack {pack.id} {pack.version} into "
+                                f"{project}/{PROFILE_NAME}? [y/N] ")
         if answer.strip().lower() not in ("y", "yes"):
             out("Declined; nothing written.")
             return {"status": "declined", "pack": pack.id,
@@ -297,6 +351,11 @@ def remove_pack(project, pack_id, assume_yes=False, force=False,
             f"it ({', '.join(e.get('pack_id', '?') for e in later)}). Remove "
             "those first, or re-run with --force to restore the profile to "
             "the state before this pack and drop the later lockfile entries.")
+    # Validate every backup this removal could restore or delete
+    # before anything is prompted, written, or unlinked.
+    removed_backups = [_validated_backup_path(project, e)
+                       for e in entries[idx:]]
+    backup_path = removed_backups[0]
     profile_path = project / PROFILE_NAME
     raw = profile_path.read_bytes() if profile_path.is_file() else None
     current_hash = _sha256_bytes(raw) if raw is not None else None
@@ -310,18 +369,18 @@ def remove_pack(project, pack_id, assume_yes=False, force=False,
             f"({entry.get('backup') or 'no backup; profile did not exist before'})"
             ", or re-run with --force to restore that backup anyway.")
     backup_rel = entry.get("backup")
-    if backup_rel and not (project / backup_rel).is_file():
+    if backup_path is not None and not backup_path.is_file():
         raise GhostPacksError(
             f"recorded backup {backup_rel} is missing; cannot reverse the "
             "merge without it")
     if not assume_yes:
-        answer = input_fn(f"Remove pack {pack_id} from {project} and restore "
-                          "the pre-merge profile? [y/N] ")
+        answer = _ask(input_fn, f"Remove pack {pack_id} from {project} and restore "
+                                "the pre-merge profile? [y/N] ")
         if answer.strip().lower() not in ("y", "yes"):
             out("Declined; nothing written.")
             return {"status": "declined", "pack": pack_id}
-    if backup_rel:
-        shutil.copyfile(project / backup_rel, profile_path)
+    if backup_path is not None:
+        shutil.copyfile(backup_path, profile_path)
         restored = "restored backup " + backup_rel
     else:
         if profile_path.is_file():
@@ -333,10 +392,9 @@ def remove_pack(project, pack_id, assume_yes=False, force=False,
     # backups of every entry being removed, and when no packs remain
     # recorded, delete the lockfile itself, so a fully-removed project
     # carries no GhostPacks artifacts for a scanner to pick up.
-    for gone in removed_entries:
-        gone_backup = gone.get("backup")
-        if gone_backup and (project / gone_backup).is_file():
-            (project / gone_backup).unlink()
+    for gone_path in removed_backups:
+        if gone_path is not None and gone_path.is_file():
+            gone_path.unlink()
     backup_dir = project / BACKUP_DIR_NAME
     if backup_dir.is_dir() and not any(backup_dir.iterdir()):
         backup_dir.rmdir()

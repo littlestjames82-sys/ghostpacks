@@ -12,9 +12,13 @@ PYTHONPATH=src python3 -m ghostpacks lint examples/demo-python-pack
 PYTHONPATH=src python3 -m ghostpacks show examples/demo-python-pack
 ```
 
-`lint` should pass. `show` should print the word **unscored** in the
-summary: the pack claims no GhostBench number, so it may not borrow
-one.
+`lint` should pass (`lint: OK - demo-python 0.1.0 (kind: context,
+unscored) [python]`). `show` should print the word **unscored** in
+the summary: the pack claims no GhostBench number, so it may not
+borrow one. `PYTHONPATH=src python3 -m ghostpacks doctor
+examples/demo-python-pack` runs the wider checks (GhostSlice range,
+freshness, Bench status) and reports the same unscored state as a
+warning, not a failure.
 
 ## 2. Merge, then remove, on the fixture project
 
@@ -27,6 +31,7 @@ cp -r examples/fixture-project /tmp/packs-demo-project
 
 PYTHONPATH=src python3 -m ghostpacks merge examples/demo-python-pack /tmp/packs-demo-project
 # read the preview diff, answer y
+# (add --yes to either command to skip the prompt; the diff is still printed)
 
 cat /tmp/packs-demo-project/.ghostslice.json      # src/** is now signatures, generated/** ignored
 cat /tmp/packs-demo-project/.ghostslice-packs.json  # provenance lockfile entry for demo-python 0.1.0
