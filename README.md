@@ -1,5 +1,6 @@
 # GhostPacks
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![CI](https://github.com/littlestjames82-sys/ghostpacks/actions/workflows/ci.yml/badge.svg)](https://github.com/littlestjames82-sys/ghostpacks/actions/workflows/ci.yml/actions)
 
 **Shareable GhostSlice profile packs: stack knowledge as data.**
 
